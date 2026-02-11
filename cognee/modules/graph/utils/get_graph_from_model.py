@@ -2,7 +2,9 @@ from datetime import datetime, timezone
 from typing import Tuple, List, Any, Dict, Optional
 from cognee.infrastructure.engine import DataPoint, Edge
 from cognee.modules.storage.utils import copy_model
+from cognee.shared.logging_utils import get_logger
 
+logger = get_logger(__name__)  # namespace to help user filter through logs
 
 def _extract_field_data(field_value: Any) -> List[Tuple[Optional[Edge], List[DataPoint]]]:
     """Extract edge metadata and datapoints from a field value."""
@@ -153,6 +155,8 @@ async def get_graph_from_model(
         Tuple of (nodes, edges) extracted from the model
     """
     if str(data_point.id) in added_nodes:
+        # %s makes it so a string is only generated when logging is enabled
+        logger.debug("Skipping already processed DatPoint: %s", data_point.id )
         return [], []
 
     nodes = []
@@ -163,19 +167,27 @@ async def get_graph_from_model(
     data_point_properties = {"type": type(data_point).__name__}
     excluded_properties = set()
     properties_to_visit = set()
-
+    
+    relationships_identified = 0;
+    pairs_identified = 0;
     # Analyze all fields to categorize them as properties or relationships
+    logger.debug("Starting graph extraction for DataPoint: %s", data_point_id)
     for field_name, field_value in data_point:
+        
         if field_name == "metadata":
+            logger.debug("Skipping metadata field for data point: %s", data_point_id )
             continue
 
         edge_datapoint_pairs = _extract_field_data(field_value)
 
         if not edge_datapoint_pairs:
             # Regular property
+            logger.debug("Categorized field: '%s' as property", field_name)
             data_point_properties[field_name] = field_value
         else:
             # DataPoint relationship
+            logger.debug("Categorized field: '%s' as relationship (Has %d pairs) ", 
+                         field_name, len(edge_datapoint_pairs))
             _process_datapoint_field(
                 data_point_id,
                 field_name,
@@ -184,7 +196,13 @@ async def get_graph_from_model(
                 properties_to_visit,
                 excluded_properties,
             )
+            relationships_identified += 1
+            pairs_identified += len(edge_datapoint_pairs)
+    
 
+    logger.info("Field Analysis Complete for DataPoint '%s'| %d properties, %d relationship types found (with %d pairs)", 
+                data_point_id, len(data_point_properties), relationships_identified, pairs_identified)
+     
     # Create node for current DataPoint if needed
     if include_root and data_point_id not in added_nodes:
         SimpleDataPointModel = copy_model(
@@ -192,11 +210,16 @@ async def get_graph_from_model(
         )
         nodes.append(SimpleDataPointModel(**data_point_properties))
         added_nodes[data_point_id] = True
+        logger.debug("Created new node: %s", data_point_id)
+
 
     # Process all relationships using generator
     for target_datapoint, field_name, edge_metadata in _targets_generator(
         data_point, properties_to_visit
     ):
+        if target_datapoint is None:
+            logger.warning("Cannot resolve edge for field: '%s'; Target data is incomplete", field_name)
+            continue
         relationship_name = _get_relationship_key(field_name, edge_metadata)
 
         # Create edge if not already added
@@ -207,6 +230,7 @@ async def get_graph_from_model(
             )
             edges.append((data_point.id, target_datapoint.id, relationship_name, edge_properties))
             added_edges[edge_key] = True
+            logger.debug("Created new edge: '%s' with key: '%s'", relationship_name, edge_key)
 
         # Mark property as visited - CRITICAL for preventing infinite loops
         property_key = _generate_property_key(
@@ -216,8 +240,9 @@ async def get_graph_from_model(
 
         # Recursively process target node if not already processed
         if str(target_datapoint.id) in added_nodes:
+            logger.debug("Skipping already processed DataPoint: %s", target_datapoint.id)
             continue
-
+        logger.debug("Moving to next DataPoint: %s from Parent DataPoint: %s", target_datapoint.id, data_point_id)
         child_nodes, child_edges = await get_graph_from_model(
             target_datapoint,
             include_root=True,
